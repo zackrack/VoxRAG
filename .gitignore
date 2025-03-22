@@ -1,0 +1,7 @@
+*.csv
+**/eval/
+**/data/
+**/transcripts/
+**/venv/
+**/__pycache__/
+.gradio/
