@@ -16,7 +16,7 @@ import soundfile as sf
 import os
 
 # Initialize OpenAI and device
-openai = OpenAI(api_key="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")
+openai = OpenAI(api_key="")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Global state for a single podcast file
