@@ -3,11 +3,11 @@ import torchaudio
 import numpy as np
 from transformers import Wav2Vec2Processor, Wav2Vec2Model
 from faster_whisper import WhisperModel
-import tempfile
 import soundfile as sf
 import os
-import io
-import base64
+import uuid
+import soundfile as sf
+import json
 
 # ----- Silero VAD Setup -----
 # Load Silero VAD model via torch.hub.
@@ -22,7 +22,7 @@ wav2vec_model.to(device)
 wav2vec_model.eval()
 
 # ----- Faster-Whisper Setup for Transcription -----
-whisper_model = WhisperModel("tiny", device="cuda", compute_type="float16")
+whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
 
 def get_audio_embedding(audio_tensor, sample_rate):
     if audio_tensor.numel() == 0:
@@ -57,54 +57,39 @@ def get_audio_embedding(audio_tensor, sample_rate):
     norm = np.linalg.norm(embedding)
     return embedding / norm if norm > 0 else embedding
 
-def assign_speakers_to_vad_segments(
-    vad_segments, vad_metadata, diarization_segments, custom_speaker_mapping
-):
+def get_speaker_activity_in_window(diarization_segments, window_start, window_end):
     """
-    Matches VAD-based speech segments with diarization speaker labels
-    by overlapping them in time. NO sub-segment is discarded,
-    even if it's under 4 seconds.
+    Returns speaker activity within a time window as:
+    {
+        "speaker_0": [{"start": 100.1, "end": 102.8}, ...],
+        "speaker_1": [...],
+    }
     """
-    matched_segments = []
-    matched_metadata = []
+    speakers_in_window = {}
 
-    for segment, meta in zip(vad_segments, vad_metadata):
-        vad_start = meta["start_time"]
-        vad_end = meta["end_time"]
-        sr = segment.shape[1] / (vad_end - vad_start)  # sample_rate from segment length
+    for seg in diarization_segments:
+        start = seg["start"]
+        end = seg["end"]
+        speaker = seg["speaker"]
 
-        # For each diarization segment, find overlap
-        for dia in diarization_segments:
-            dia_start = dia["start"]
-            dia_end = dia["end"]
+        if end < window_start or start > window_end:
+            continue
 
-            # Skip if no overlap
-            if dia_end <= vad_start or dia_start >= vad_end:
-                continue
+        clipped_start = max(start, window_start)
+        clipped_end = min(end, window_end)
+        duration = clipped_end - clipped_start
+        if duration <= 0:
+            continue
 
-            # Clip to VAD boundaries
-            start_time = max(vad_start, dia_start)
-            end_time = min(vad_end, dia_end)
+        if speaker not in speakers_in_window:
+            speakers_in_window[speaker] = []
 
-            if end_time <= start_time:
-                continue
+        speakers_in_window[speaker].append({
+            "start": round(clipped_start, 3),
+            "end": round(clipped_end, 3)
+        })
 
-            # Slice out the overlapping audio
-            rel_start = int((start_time - vad_start) * sr)
-            rel_end = int((end_time - vad_start) * sr)
-            sub_segment = segment[:, rel_start:rel_end]
-
-            new_meta = {
-                "start_time": start_time,
-                "end_time": end_time,
-                "speaker_label": dia["speaker"],
-                "speaker": custom_speaker_mapping.get(dia["speaker"], dia["speaker"]),
-            }
-
-            matched_segments.append(sub_segment)
-            matched_metadata.append(new_meta)
-
-    return matched_segments, matched_metadata
+    return speakers_in_window
 
 
 def mmr_rerank(query_embedding, candidate_embeddings, candidate_indices, top_k=10, lambda_param=0.5):
@@ -148,7 +133,7 @@ def mmr_rerank(query_embedding, candidate_embeddings, candidate_indices, top_k=1
     # Map back to original indices
     return [candidate_indices[i] for i in selected]
 
-def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=3.0, target_duration=10.0, max_chunk_size=20.0):
+def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=5.0, target_duration=30.0, max_chunk_size=60.0):
     """
     Smart segmentation with NO AUDIO LOSS:
     - Uses VAD to detect speech.
@@ -174,7 +159,7 @@ def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=
         end_time = ts["end"] / sample_rate
         duration = end_time - start_time
 
-        print(f"⏳ Found segment {i+1}: {duration:.2f} sec ({start_time:.2f}s → {end_time:.2f}s)")
+        # print(f"⏳ Found segment {i+1}: {duration:.2f} sec ({start_time:.2f}s → {end_time:.2f}s)")
 
         if temp_start is None:
             temp_start, temp_end = start_time, end_time
@@ -182,17 +167,17 @@ def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=
             current_duration = temp_end - temp_start
             gap = start_time - temp_end
 
-            if gap <= 1.0 and current_duration < target_duration:
-                print(f"🔗 Merging with segment {i+1} (gap: {gap:.2f}s, current total: {current_duration:.2f}s)")
+            if gap <= 3.0 and current_duration < target_duration:
+                # print(f"🔗 Merging with segment {i+1} (gap: {gap:.2f}s, current total: {current_duration:.2f}s)")
                 temp_end = end_time
             else:
                 final_duration = temp_end - temp_start
                 if final_duration >= min_duration:
                     merged_segments.append((temp_start, temp_end))
                     metadata.append({"start_time": temp_start, "end_time": temp_end})
-                    print(f"✅ Finalized merged segment: {final_duration:.2f}s")
-                else:
-                    print(f"⚠️ Skipped short segment: {final_duration:.2f}s")
+                    # print(f"✅ Finalized merged segment: {final_duration:.2f}s")
+                # else:
+                    # print(f"⚠️ Skipped short segment: {final_duration:.2f}s")
                 temp_start, temp_end = start_time, end_time
 
     # Add last segment
@@ -202,7 +187,7 @@ def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=
             merged_segments.append((temp_start, temp_end))
             metadata.append({"start_time": temp_start, "end_time": temp_end})
             print(f"✅ Finalized last segment: {final_duration:.2f}s")
-        else:
+        # else:
             print(f"⚠️ Skipped last short segment: {final_duration:.2f}s")
 
     print(f"🔍 Merged into {len(merged_segments)} segments (min {min_duration}s each, target ~{target_duration}s).")
@@ -225,7 +210,7 @@ def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=
 
                 final_segments.append(audio_tensor[:, start_idx:end_idx])
                 final_metadata.append({"start_time": start_time, "end_time": chunk_end})
-                print(f"🔪 Split long segment: {chunk_end - start_time:.2f}s")
+                # print(f"🔪 Split long segment: {chunk_end - start_time:.2f}s")
 
                 start_time = chunk_end
 
@@ -283,72 +268,39 @@ def transcribe_with_fasterwhisper(audio_data, sample_rate, language="en"):
     
     return transcription
 
-def audio_to_html(audio_data, sample_rate):
-    """
-    Converts a numpy audio array into an HTML <audio> element with a base64-encoded WAV.
-    Checks for empty segments and ensures data is in float32 within [-1, 1].
-    """
-    import tempfile, os, base64, numpy as np
-    import soundfile as sf
+import base64
+import io 
 
-    # Remove extra dimensions.
-    audio_data = np.squeeze(audio_data)
-    
-    # Check if the segment is empty.
-    if audio_data.size == 0 or (audio_data.ndim == 1 and audio_data.shape[0] == 0) or \
-       (audio_data.ndim == 2 and audio_data.shape[1] == 0):
-        return "<div>No audio available</div>"
-    
-    # If 2D (channels, samples), transpose to (samples, channels).
-    if audio_data.ndim == 2:
-        audio_data = audio_data.T
+def audio_to_html(audio_np, sample_rate):
+    if audio_np.ndim > 1:
+        audio_np = audio_np.mean(axis=0)
 
-    # Ensure data is float32 in range [-1, 1].
-    if np.issubdtype(audio_data.dtype, np.floating):
-        audio_data = np.clip(audio_data, -1, 1).astype(np.float32)
-    else:
-        audio_data = audio_data.astype(np.float32)
-    
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        temp_filename = tmp.name
-    try:
-        # Write as a 16-bit PCM WAV file.
-        sf.write(temp_filename, audio_data, sample_rate, format="WAV", subtype="PCM_16")
-        with open(temp_filename, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-    except Exception as e:
-        print("Error writing audio:", e)
-        return "<div>Error generating audio</div>"
-    finally:
-        os.remove(temp_filename)
-    
-    return f'<audio controls src="data:audio/wav;base64,{b64}"></audio>'
+    buffer = io.BytesIO()
+    sf.write(buffer, audio_np.T, sample_rate, format="WAV")
+    buffer.seek(0)
+    b64_audio = base64.b64encode(buffer.read()).decode("utf-8")
+    return f'<audio controls src="data:audio/wav;base64,{b64_audio}"></audio>'
 
-import json
 import os
-
 import json
-import os
+import datetime
 
-def save_embeddings_to_jsonl(jsonl_path, embeddings_tensor, metadata):
-    """
-    Save embeddings + metadata to a JSONL file on disk.
+def get_unique_filename(base_dir="data", prefix="segments", extension="jsonl"):
+    # Create the base directory if it doesn't exist.
+    os.makedirs(base_dir, exist_ok=True)
+    # Use a timestamp to make the filename unique.
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{prefix}_{timestamp}.{extension}"
+    return os.path.join(base_dir, filename)
 
-    Args:
-        jsonl_path (str): where to write the file
-        embeddings_tensor (torch.Tensor): shape [N, D]
-        metadata (List[dict]): one dict per segment
-    """
-    os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
-    with open(jsonl_path, "w") as f:
-        for i, (embedding, meta) in enumerate(zip(embeddings_tensor, metadata)):
-            entry = {
-                "segment_id": i,
-                "embedding": embedding.cpu().tolist(),
-                "metadata": meta
+def save_embeddings_to_jsonl(file_path, embeddings_tensor, metadata_list):
+    with open(file_path, "w", encoding="utf-8") as f:
+        for emb, meta in zip(embeddings_tensor.tolist(), metadata_list):
+            record = {
+                "embedding": emb,
+                "metadata": meta,
             }
-            f.write(json.dumps(entry) + "\n")
-    print(f"✅ Saved {len(metadata)} segments to {jsonl_path}")
+            f.write(json.dumps(record) + "\n")
 
 def query_from_jsonl(query_embedding, jsonl_path, top_k=10):
     """
@@ -496,3 +448,4 @@ def diarize_segment(audio_data, sample_rate):
     shutil.rmtree(out_dir)
 
     return segments
+
