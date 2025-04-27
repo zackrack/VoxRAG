@@ -11,10 +11,12 @@ from helpers import (
 )
 from embeddings import get_audio_embedding, get_clap_embedding, save_embeddings_to_jsonl, query_from_jsonl
 from speakers import assign_speaker_activity_to_vad_chunks, transcribe_with_fasterwhisper_and_assign_speaker_labels
-from rerankers import rerank_with_mmr, rerank_with_rrf
+from rerankers import rerank_with_mmr, reciprocal_rank_fusion, rerank_segments
 import os
 from collections import defaultdict
 import faiss
+
+torchaudio.set_audio_backend("ffmpeg")
 
 use_clap = True
 # Initialize OpenAI and device
@@ -61,9 +63,9 @@ def generate_mapping_ui_for_all_podcasts():
 
     if not single_file_state.get("metadata"):
         return "<div>📭 No metadata loaded.</div>", []
-    boxes=[]
-    MAX_SEGMENTS_PER_PODCAST = 3
-    MAX_AUDIO_SECONDS = 60 
+
+    boxes = []
+    MAX_AUDIO_SECONDS = 60
 
     metadata = single_file_state["metadata"]
     audio_segments = single_file_state["audio_tensor"]
@@ -78,46 +80,41 @@ def generate_mapping_ui_for_all_podcasts():
     full_html = ""
     added_main_podcast = False
 
-
     for title, segments in title_to_segments.items():
-        # 👇 One base podcast only (no "ft.")
-        if "ft." not in title.lower():
-            if added_main_podcast:
-                continue  # already added base show
-            added_main_podcast = True
+        is_guest = "ft." in title.lower()
+
+        if is_guest:
+            section_label = "🎤 Guest Podcast"
         else:
-            # 👇 Only include podcasts with "ft." in title
-            if "ft." not in title.lower():
-                continue
+            if added_main_podcast:
+                continue  # already added one base podcast
+            added_main_podcast = True
+            section_label = "🎧 Base Podcast"
 
-        segments = segments[:MAX_SEGMENTS_PER_PODCAST]
+        # Only show one segment per podcast title
+        meta, snippet = segments[0]
 
-        # Speaker mapping preview
-        current_mapping = {}
-        for meta, _ in segments:
-            raw = meta.get("speaker_label")
-            mapped = meta.get("speaker", raw)
-            current_mapping[raw] = mapped
-
+        # Speaker mapping
+        raw = meta.get("speaker_label")
+        mapped = meta.get("speaker", raw)
+        current_mapping = {raw: mapped}
         mapping_json = json.dumps(current_mapping, indent=2)
         boxes.append((title, mapping_json))
 
-        full_html += f"<h3>🎙️ {title}</h3><div style='border:1px solid #aaa;padding:8px;margin-bottom:10px;'>"
+        # HTML
+        full_html += f"<h3>{section_label}: {title}</h3>"
+        full_html += "<div style='border:1px solid #aaa;padding:8px;margin-bottom:10px;'>"
         full_html += f"<b>Speaker Mapping:</b><pre>{mapping_json}</pre>"
 
-        # Segment previews
-        for i, (meta, snippet) in enumerate(segments):
-            transcript = meta.get("transcript_with_speaker_labels", "No transcript.")
-            try:
-                snippet_np = snippet.cpu().numpy()
-                if MAX_AUDIO_SECONDS:
-                    snippet_np = snippet_np[:, :sample_rate * MAX_AUDIO_SECONDS]
-                audio_html = audio_to_html(snippet_np, sample_rate)
-            except Exception as e:
-                audio_html = f"<div>Error loading audio: {e}</div>"
+        transcript = meta.get("transcript_with_speaker_labels", "No transcript.")
+        try:
+            snippet_np = snippet.cpu().numpy()
+            snippet_np = snippet_np[:, :sample_rate * MAX_AUDIO_SECONDS]
+            audio_html = audio_to_html(snippet_np, sample_rate)
+        except Exception as e:
+            audio_html = f"<div>Error loading audio: {e}</div>"
 
-            full_html += f"<h5>Segment {i+1}</h5><pre>{transcript}</pre>{audio_html}<br><br>"
-
+        full_html += f"<h5>Segment Preview</h5><pre>{transcript}</pre>{audio_html}<br><br>"
         full_html += "</div>"
 
     return full_html, boxes
@@ -130,7 +127,6 @@ def collect_and_apply_mappings(mapping_state, *textbox_values):
         except Exception:
             return f"❌ Invalid JSON for episode: {title}"
     return apply_per_podcast_speaker_mapping(json.dumps(combined))
-
 
 def get_extracted_speaker_mapping():
     """
@@ -225,7 +221,6 @@ def load_full_state(path="data/full_state.pt"):
         print(f"❌ Exception in load_full_state: {e}")
         return f"❌ Error loading state: {str(e)}"
 
-
 def apply_per_podcast_speaker_mapping(mapping_json_by_title):
     """
     Accepts a dict of { title: { speaker_0: Name, ... } }
@@ -260,6 +255,24 @@ def apply_per_podcast_speaker_mapping(mapping_json_by_title):
     except Exception as e:
         return f"❌ Error applying mappings: {str(e)}"
 
+import subprocess 
+
+def load_mp3_ffmpeg(filepath, target_sr=16000):
+    cmd = [
+        "ffmpeg",
+        "-i", filepath,
+        "-f", "f32le",
+        "-acodec", "pcm_f32le",
+        "-ac", "1",
+        "-ar", str(target_sr),
+        "-"
+    ]
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    audio_data = process.stdout.read()
+    audio_np = np.frombuffer(audio_data, dtype=np.float32)
+    audio_tensor = torch.tensor(audio_np).unsqueeze(0)  # shape: [1, samples]
+    print(f"🧪 Loaded {filepath} — shape: {audio_tensor.shape}, max: {audio_tensor.max().item()}, min: {audio_tensor.min().item()}")
+    return audio_tensor, target_sr
 
 def index_podcast_folder(podcasts_folder="podcasts"):
     all_segments = []
@@ -267,7 +280,7 @@ def index_podcast_folder(podcasts_folder="podcasts"):
 
     # Iterate over all MP3 files in the podcasts folder
     for file in sorted(os.listdir(podcasts_folder)):
-        if file.endswith(".mp3"):
+        if file.endswith((".mp3", ".wav", ".webm")):
             file_path = os.path.join(podcasts_folder, file)
             base_name = file.rsplit('.', 1)[0]
             json_path = os.path.join(podcasts_folder, f"{base_name}.json")
@@ -279,17 +292,17 @@ def index_podcast_folder(podcasts_folder="podcasts"):
             #print(f"\n🔍 Indexing {file_path}...")
 
             # Load + resample audio
-            audio_tensor, sample_rate = torchaudio.load(file_path)
+            audio_tensor, sample_rate = load_mp3_ffmpeg(file_path)
             if sample_rate != 16000:
                 resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
                 audio_tensor = resampler(audio_tensor)
                 sample_rate = 16000
 
             # --- Limit to the first 5 minutes (300 seconds) ---
-            max_duration_seconds = 60  # 5 minutes
-            max_samples = int(max_duration_seconds * sample_rate)
-            if audio_tensor.shape[1] > max_samples:
-                audio_tensor = audio_tensor[:, :max_samples]
+            # max_duration_seconds = 60  # 5 minutes
+            # max_samples = int(max_duration_seconds * sample_rate)
+            # if audio_tensor.shape[1] > max_samples:
+            #     audio_tensor = audio_tensor[:, :max_samples]
             # ---------------------------------------------------
 
             audio_np = audio_tensor.cpu().numpy()
@@ -369,145 +382,228 @@ def index_podcast_folder(podcasts_folder="podcasts"):
     return f"✅ Indexed podcasts folder: {len(stored_segments)} segments from all podcasts."
 
 
-def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
-    """
-    1) Loads and embeds the query audio.
-    2) Reads all stored segments from data/segments.jsonl, normalizes their embeddings.
-    3) Computes similarity to the query, applies a length-based boost, and picks top candidates.
-    4) Uses precomputed transcriptions (with raw speaker labels) from indexing to build the final answer.
+def run_evaluation():
+    import csv
+    from pathlib import Path
+
+    queries = [
+    "What are some other anime ‘genre mashups’ that completely surprised you?",
+    "Garnt, what’s the silliest sibling argument you remember, and how did you end up working it out?",
+    "Joey, how do you even plan a trip to a place with so little tourism info available, like Greenland or Madagascar?",
+    "Connor, what would you tell your younger self about ‘fitting in’ given your experiences with coin-flip vodka games and peer pressure at Uni?",
+    "What’s your new minimum standard for accommodations on tour after the horrifying LA shower and cobweb-filled top floor?",
+    "Do you think you’ll ever reach Connor’s 40-second gold-split shower record, or is that physically impossible for you?",
+    "How do musicals and stage plays influence the anime community compared to traditional marketing?",
+    "Did your school sports positions translate into how you approach teamwork as adults?",
+    "How do you balance traveling for exotic adventures and sticking to comfort zones like needing a hot shower each morning?",
+    "What’s the first rule or guideline for replicating the ‘Seven Wonders of Anime’ discussion?",
+    "What titles would make your personal ‘Seven Wonders of Anime’ and why?",
+    "What ultimately pushes ‘Gundam’ or ‘Evangelion’ over the other for the mecha spot?",
+    "Garnt, do you still think ‘One Piece’ can surpass Goku’s legacy once it ends?",
+    "Did ‘Haruhi Suzumiya’ genuinely shape modern anime adaptations more than ‘Death Note’?",
+    "What makes ‘High School of the Dead’ stand out from other ecchi/harem shows?",
+    "Between ‘Astro Boy,’ ‘Sailor Moon,’ and other classics, which one belongs on the anime Mount Rushmore?",
+    "Connor, have your feelings on ‘Akira’ changed—do you now see it as a top-tier anime movie?",
+    "Was there an underrated anime you fought to include in the Wonders debate that got shut down?",
+    "What’s one anti-bucket list activity you each tried once and vowed never to do again?",
+    "How did ‘Ring of Fire’ and dirty pints shape your drinking habits today?",
+    "What’s your worst blackout story and how did it feel waking up not knowing where you were?",
+    "Joey, do you regret the kamikaze tequila shot with snorting salt and lemon in your eye, or would you do it again?",
+    "Garnt, is it true you once drank washing-up liquid during a game? How did that happen?",
+    "What liquor can each of you no longer stomach because of a bad hangover?",
+    "Connor, did the coin-flipping vodka game night make you hate doing mass shots?",
+    "What’s your take on the ‘multiday hangover,’ and how do you survive them now that you're older?",
+    "What travel conditions now make or break a trip for you?",
+    "If you could pick one unconventional travel destination, where would you go and why?",
+    "Joey, is Machu Picchu still on your bucket list or has another place replaced it?",
+    "Which is worse: cold showers every day or no access to warm water at all?",
+    "Garnt, how did living as a monk in Thailand shape your view on daily comforts like beds and hot showers?",
+    "Can the one-minute shower routine ever replace your normal shower, or is that impossible?",
+    "Why are you all so different about morning vs. night showers? Does it cause trip friction?",
+    "What was your worst shared bathroom experience—especially the LA top-floor horror?",
+    "Connor, did that LA shower change how you view traveling for shows?",
+    "Joey and Connor, what’s your best tip to get Garnt to show up on time despite his long morning showers?",
+    "Garnt, what’s your Windows XP boot-up morning routine and why must it include a hot shower?",
+    "Do you miss sibling fights or appreciate your calmer adult relationships now?",
+    "What’s your funniest childhood sibling fight story—did any get out of hand?",
+    "Joey, how did growing up with one sister compare to Connor’s chaos of multiple brothers?",
+    "If you had to recommend a single anime to a newbie (not Death Note or AOT), what would it be?",
+    "What’s your advice for surviving college drinking culture?",
+    "Has your perspective on clubbing changed after some awful nights?",
+    "Would you actually consider freezing for a once-in-a-lifetime trip to Greenland or Antarctica?",
+    "Did hating rugby or football as kids affect your views on fitness as adults?",
+    "Connor, do you ever miss being a goalie or is that firmly on your anti-bucket list?",
+    "If forced to retry a winter sport, which would you choose—snowboarding, skiing, etc.?",
+    "Looking back, were those wild party nights worth the stories or just dumb?",
+    "What anime best captures the experience of being a broke, binge-drinking college student?",
+    "If you made a Trash Taste Bingo Card, what squares would be absolutely required?"
+    ]
+    AGENT_NAME = "agenteuc"
+    QUERY_AUDIO_DIR = Path("eval/queries_audio")
+    DOC_FILE = "eval/documents_cos_cross_100.csv"
+    ANSWER_FILE = "eval/answers_cos_cross_100.csv"
+
+    try:
+        with open(DOC_FILE, "w", newline='', encoding="utf-8") as doc_f, open(ANSWER_FILE, "w", newline='', encoding="utf-8") as ans_f:
+            doc_writer = csv.writer(doc_f)
+            doc_writer.writerow(["qid", "did", "document"])
+
+            ans_writer = csv.writer(ans_f)
+            ans_writer.writerow(["qid", "agent", "answer"])
+
+            for i, query in enumerate(queries):
+                audio_path = QUERY_AUDIO_DIR / f"audios--{i+1:02d}.wav"
+
+                if not audio_path.exists():
+                    print(f"⚠️ Skipping Q{i}: {audio_path.name} does not exist.")
+                    ans_writer.writerow([i, AGENT_NAME, "ERROR: Missing audio file"])
+                    continue
+
+                print(f"🔍 Processing Q{i}: {query}")
+                print(f"🎧 Using audio: {audio_path}")
+
+                try:
+                    result = query_rag(str(audio_path), single_file_state)
+
+                    if not isinstance(result, tuple) or len(result) != 4:
+                        raise ValueError("query_rag() must return a 4-tuple: (answer, html, all_context, retrieved_only)")
+
+                    answer, html, all_context, retrieved_only = result
+
+                    if not retrieved_only or not isinstance(retrieved_only, list):
+                        raise ValueError("Retrieved segments missing or not a list")
+
+                    for j, (did, speaker, text) in enumerate(retrieved_only):
+                        clean_text = text.strip().replace("\n", " ")
+                        doc_writer.writerow([i, did, f"{speaker} said: {clean_text}"])
+
+                    ans_writer.writerow([i, AGENT_NAME, answer.strip()])
+                    print(f"✅ Q{i} completed.")
+
+                except Exception as e:
+                    print(f"❌ Error on Q{i}: {e}")
+                    ans_writer.writerow([i, AGENT_NAME, "ERROR"])
+
+        return "✅ Evaluation completed. Results saved to answers.csv and documents.csv."
+
+    except Exception as e:
+        return f"❌ Evaluation failed: {e}"
     
-    Args:
-        query_audio_file (str): Path to the user's query audio file.
-        lambda_param (float): MMR trade-after.
-        length_alpha (float): Strength of the length boost.
-    """
-    import math
-    import json
+def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
+    import os
     import torch
+    import faiss
     import numpy as np
     from torch.nn import functional as F
 
     if query_audio_file is None:
+        print("❌ No query_audio_file provided.")
         return "Provide a query audio clip.", "", []
 
-    if not os.path.exists("data/segments.jsonl"):
-        return "Index a podcast first.", "", []
+    if not os.path.exists(query_audio_file):
+        print(f"❌ Audio file not found: {query_audio_file}")
+        return "Audio file not found.", "", []
 
-    # 1) Load & resample query audio
-    query_tensor, query_sr = torchaudio.load(query_audio_file)
+    print(f"🎧 Loading audio: {query_audio_file}")
+    query_tensor, query_sr = load_mp3_ffmpeg(query_audio_file)
+    if query_tensor is None or query_tensor.numel() == 0:
+        print("❌ Failed to load or empty audio.")
+        return "Failed to load audio file.", "", []
+
     if query_sr != 16000:
+        print("🔁 Resampling to 16kHz")
         resampler = torchaudio.transforms.Resample(query_sr, 16000)
         query_tensor = resampler(query_tensor)
-        query_sr = 16000
     if query_tensor.dim() > 1:
         query_tensor = query_tensor.mean(dim=0)
 
-    # Transcribe the user's query (for context)
     query_audio_np = query_tensor.cpu().numpy()
-    query_transcription = transcribe_with_fasterwhisper(query_audio_np, query_sr)
+    query_transcription = transcribe_with_fasterwhisper(query_audio_np, 16000)
 
-    # 2) Compute the query embedding
-    query_embedding = get_clap_embedding(query_tensor, query_sr)
+    query_embedding = get_clap_embedding(query_tensor, 16000)
     query_tensor = torch.tensor(query_embedding).float()
     query_tensor = F.normalize(query_tensor, dim=0).unsqueeze(0)
 
-    # 3) Load & normalize all indexed embeddings
     entries = single_file_state.get("jsonl_entries", [])
     all_embeddings_tensor = single_file_state.get("normalized_embeddings", None)
-    if all_embeddings_tensor is not None:
-        all_embeddings_tensor = all_embeddings_tensor.to(query_tensor.device)
 
     if not entries or all_embeddings_tensor is None:
-        return "Embeddings or metadata not loaded. Please index or load a saved state first.", "", []
+        print("❌ Embeddings or entries missing from state.")
+        return "Embeddings or metadata not loaded.", "", []
 
-    # Compute similarity
+    all_embeddings_tensor = all_embeddings_tensor.to(query_tensor.device)
     query_tensor = query_tensor.to(all_embeddings_tensor.device)
 
-    # Compute similarity
     query_np = query_tensor.squeeze(0).cpu().numpy().astype(np.float32)
-    faiss.normalize_L2(query_np.reshape(1, -1))  # normalize query for cosine
+    faiss.normalize_L2(query_np.reshape(1, -1))
 
-    # Prepare FAISS index (if not already built and cached)
+    # 🔧 Rebuild FAISS if needed
     if "faiss_index" not in single_file_state:
+        print("⚠️ Rebuilding FAISS index...")
         all_embeddings_np = all_embeddings_tensor.cpu().numpy().astype(np.float32)
-        faiss.normalize_L2(all_embeddings_np)  # normalize embeddings for cosine
+        faiss.normalize_L2(all_embeddings_np)
         index = faiss.IndexFlatIP(all_embeddings_np.shape[1])
         index.add(all_embeddings_np)
         single_file_state["faiss_index"] = index
     else:
         index = single_file_state["faiss_index"]
 
-    # Run FAISS search
-    top_k_pool = 50
+    top_k_pool = 100
     D, I = index.search(query_np.reshape(1, -1), k=min(top_k_pool, len(entries)))
     top_indices = I[0].tolist()
-    top_results = [entries[i] for i in top_indices][:10]
+    valid_indices = [i for i in top_indices if 0 <= i < len(entries)]
 
-    
-    # Optional reranking: Uncomment ONE of the following
-    # 🔁 RRF
-    # top_results = rerank_with_rrf(top_results, [boosted_scores[i] for i in top_indices])[:5]
+    top_results = [entries[i] for i in valid_indices][:10]
 
-    # 🔁 MMR
-    # candidate_embs = all_embeddings_tensor[top_indices]
-    # top_k_mmr_indices = rerank_with_mmr(query_tensor, candidate_embs, top_k=len(top_indices), lambda_param=lambda_param)
-    # top_results = [top_results[i] for i in top_k_mmr_indices][:5]
+    # Top-k for reranking
+    # retrieved_segments_for_rerank = [entries[i] for i in valid_indices]  # (e.g. top 50)
 
-    # Get the title of the main matching segment
-    titles_in_results = set(
-        r["metadata"].get("podcast_title", "Unknown") for r in top_results
-    )
+    # Run reranker here
+    # query_text = query_transcription  # This is your natural language query
+    # reranked = rerank_segments(query_text, retrieved_segments_for_rerank)
 
-    # def format_speaker_mapping_block(titles):
-    #     lines = ["Speaker Mapping by Episode:"]
-    #     for title in titles:
-    #         speaker_map = per_podcast_speaker_mapping.get(title, {})
-    #         if not speaker_map:
-    #             continue
-    #         lines.append(f"- {title}:")
-    #         for speaker_id, name in speaker_map.items():
-    #             lines.append(f"  {speaker_id} = {name}")
-    #     return "\n".join(lines)
-    # speaker_mapping_block = format_speaker_mapping_block(titles_in_results)
+    # Now slice the top 10
+    # top_results = reranked[:10]
 
-    # 4) Build final answer with context segments
-    prompt = f"User: {query_transcription}\n"
-    prompt += "Transcription:\n"
+    print(f"🔍 Top segment_ids: {[r['segment_id'] for r in top_results]}")
 
+    prompt = f"User: {query_transcription}\nTranscription:\n"
     added_ids = set()
     segment_contexts = []
     audio_segments_to_display = []
 
-    for rank, result in enumerate(top_results):
+    for result in top_results:
         idx = result["segment_id"]
-
-        for offset in [-1, 0, 1]:
-            neighbor_idx = idx + offset
-            if neighbor_idx < 0 or neighbor_idx >= len(single_file_state["metadata"]):
+        for neighbor_idx in [idx - 1, idx, idx + 1]:
+            if not (0 <= neighbor_idx < len(single_file_state["metadata"])):
+                print(f"⏭️ Skipping OOB segment {neighbor_idx}")
                 continue
             if neighbor_idx in added_ids:
                 continue
 
-            added_ids.add(neighbor_idx)
             meta = single_file_state["metadata"][neighbor_idx]
-            seg_transcription = meta.get("transcript_with_speaker_labels", "No transcription available.")
-            start = meta["start_time"]
-            end = meta["end_time"]
-            duration = end - start
-            title = meta.get("podcast_title", "Unknown")
-            speaker = meta.get("speaker", "unknown")
+            transcript = meta.get("transcript_with_speaker_labels")
+            if not transcript or transcript.strip() == "":
+                print(f"⚠️ Skipping empty transcript at segment {neighbor_idx}")
+                continue
 
+            speaker = meta.get("speaker", "unknown")
+            title = meta.get("podcast_title", "Unknown")
+            start = meta.get("start_time", 0)
+            end = meta.get("end_time", 0)
+            duration = end - start
             role = "relevant match" if neighbor_idx == idx else "context"
             seg_num = len(segment_contexts) + 1
 
             prompt += (
                 f"Segment {seg_num} ({role}):\n"
                 f"[{start:.2f}s – {end:.2f}s] (duration: {duration:.1f}s)\n"
-                f"{seg_transcription}\n"
+                f"{transcript}\n"
                 f"in the episode: {title}\n\n"
             )
 
-            segment_contexts.append((speaker, seg_transcription))
+            segment_contexts.append((speaker, transcript))
+            added_ids.add(neighbor_idx)
 
             snippet = single_file_state["audio_tensor"][neighbor_idx]
             snippet_np = snippet.cpu().numpy()
@@ -518,38 +614,57 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
             )
             audio_segments_to_display.append(audio_html)
 
-    mapping_block = "Speaker Mappings:\n" + "\n".join(
-        f"{title}: {json.dumps(mapping, indent=2)}" 
-        for title, mapping in per_podcast_speaker_mapping.items()
-    )
+    print(f"✅ Returning {len(segment_contexts)} transcript segments")
 
-    # 🔥 Final prompt to LLM
+    mapping_block = {
+        "The 7 Anime That Every Fan NEEDS To Watch Trash Taste #172": {
+            "speaker_0": "Joey",
+            "speaker_1": "Connor",
+            "speaker_3": "Garnt"
+        }
+    }
+
     response = openai.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",
                 "content": (
                     f"""You are a helpful assistant that uses only the provided transcription to answer the user's query. 
-                    Please cite the *Segment number* (e.g., "Segment 2"F) and answer in your own words. 
-                    Do not use timestamps. 
-                    Speaker labels like "speaker_0" appear in the transcript. Here are the mappings of speaker labels to real speaker names:
+                    Please cite the *Segment number* (e.g., "Segment 2") and answer in your own words. 
+                    Do not use timestamps. Speaker labels like "speaker_0" appear in the transcript. 
+                    If the context is there, please use the names of the people talking instead of speaker_0, etc.
+
+                    Here are the mappings of speaker labels to real speaker names:
                     {mapping_block}
 
                     If the user asks about a specific speaker, answer only from that speaker's content. 
                     If it’s a general or indirect query, include perspectives from multiple speakers if relevant.
 
                     Use only the most relevant segments (marked as 'relevant match') when forming your main answer."""
-                                    )
+                )
             },
             {"role": "user", "content": prompt + "\nAssistant:\n"}
         ],
         temperature=0.7,
         max_tokens=500,
     )
-    answer = response.choices[0].message.content
 
-    return answer, "".join(audio_segments_to_display), segment_contexts
+    answer = response.choices[0].message.content
+    print(f"🧠 Answer generated. Length: {len(answer)} chars")
+
+    retrieved_segments = []
+    for r in top_results:
+        segment_id = r["segment_id"]
+        if 0 <= segment_id < len(single_file_state["metadata"]):
+            meta = single_file_state["metadata"][segment_id]
+            speaker = meta.get("speaker", "unknown")
+            transcript = meta.get("transcript_with_speaker_labels", "").strip()
+            if transcript:
+                retrieved_segments.append((segment_id, speaker, transcript))
+    print(retrieved_segments)
+    return answer, "".join(audio_segments_to_display), segment_contexts, retrieved_segments
+
 
 def get_example_segments_and_timelines_html():
     """
@@ -650,6 +765,11 @@ def get_per_podcast_speaker_mapping():
 with gr.Blocks() as demo:
     gr.Markdown("# Podcast RAG System")
 
+    with gr.Tab("📊 Run Evaluation"):
+        eval_btn = gr.Button("Run Evaluation on All Queries")
+        eval_status = gr.Textbox(label="Evaluation Status")
+        eval_btn.click(fn=run_evaluation, inputs=None, outputs=eval_status)
+
     with gr.Tab("Save and Load"):
         load_btn = gr.Button("🔁 Load Saved State")
         load_status = gr.Textbox()
@@ -704,4 +824,4 @@ with gr.Blocks() as demo:
 demo.launch()
 
 if __name__ == "__main__":
-    demo.launch(debug=False)
+    demo.launch(server_port=7860, share=False)

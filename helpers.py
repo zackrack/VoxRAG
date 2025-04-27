@@ -21,6 +21,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 wav2vec_model.to(device)
 wav2vec_model.eval()
 
+torchaudio.set_audio_backend("ffmpeg")
+
 # ----- Faster-Whisper Setup for Transcription -----
 whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
 
@@ -133,7 +135,7 @@ def mmr_rerank(query_embedding, candidate_embeddings, candidate_indices, top_k=1
     # Map back to original indices
     return [candidate_indices[i] for i in selected]
 
-def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=5.0, target_duration=30.0, max_chunk_size=60.0):
+def segment_audio_silero(audio_tensor, sample_rate, threshold=0.15, min_duration=1.0, target_duration=30.0, max_chunk_size=90.0):
     """
     Smart segmentation with NO AUDIO LOSS:
     - Uses VAD to detect speech.
@@ -141,6 +143,13 @@ def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=
     - Keeps shorter segments (≥ min_duration) when needed.
     - Splits overly long segments (> max_chunk_size).
     """
+
+    # inside segment_audio_silero(...)
+    threshold = 0.3              # default is 0.5 — good starting point
+    gap = 0.8                    # merge if silence is less than this
+    target_duration = 45.0       # try splitting semantically around 30-45s
+    max_chunk_size = 90.0        # keep this cap to avoid bloating
+
     if sample_rate != 16000:
         audio_tensor = torchaudio.transforms.Resample(sample_rate, 16000)(audio_tensor)
 
@@ -161,24 +170,26 @@ def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=
 
         # print(f"⏳ Found segment {i+1}: {duration:.2f} sec ({start_time:.2f}s → {end_time:.2f}s)")
 
+        
         if temp_start is None:
             temp_start, temp_end = start_time, end_time
         else:
             current_duration = temp_end - temp_start
             gap = start_time - temp_end
 
-            if gap <= 3.0 and current_duration < target_duration:
+            if gap <= 0.5 and current_duration < target_duration:
                 # print(f"🔗 Merging with segment {i+1} (gap: {gap:.2f}s, current total: {current_duration:.2f}s)")
                 temp_end = end_time
             else:
                 final_duration = temp_end - temp_start
                 if final_duration >= min_duration:
+                    # ✅ finalize current segment
                     merged_segments.append((temp_start, temp_end))
                     metadata.append({"start_time": temp_start, "end_time": temp_end})
-                    # print(f"✅ Finalized merged segment: {final_duration:.2f}s")
-                # else:
-                    # print(f"⚠️ Skipped short segment: {final_duration:.2f}s")
-                temp_start, temp_end = start_time, end_time
+                    temp_start, temp_end = start_time, end_time
+                else:
+                    # 🚫 don't throw it away yet — maybe next chunk will help
+                    temp_end = end_time  # extend to include this chunk
 
     # Add last segment
     if temp_start is not None and temp_end is not None:
@@ -186,8 +197,7 @@ def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=
         if final_duration >= min_duration:
             merged_segments.append((temp_start, temp_end))
             metadata.append({"start_time": temp_start, "end_time": temp_end})
-            print(f"✅ Finalized last segment: {final_duration:.2f}s")
-        # else:
+        else:
             print(f"⚠️ Skipped last short segment: {final_duration:.2f}s")
 
     print(f"🔍 Merged into {len(merged_segments)} segments (min {min_duration}s each, target ~{target_duration}s).")
@@ -213,8 +223,10 @@ def segment_audio_silero(audio_tensor, sample_rate, threshold=0.3, min_duration=
                 # print(f"🔪 Split long segment: {chunk_end - start_time:.2f}s")
 
                 start_time = chunk_end
-
+    total_speech = sum(seg["end_time"] - seg["start_time"] for seg in metadata)
+    print(f"🗣️ Total detected speech: {total_speech / 3600:.2f} hours")
     print(f"✅ Finalized {len(final_segments)} segments after max-length splitting.")
+
     return final_segments, final_metadata
 
 
