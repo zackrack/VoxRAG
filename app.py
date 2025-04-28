@@ -9,13 +9,15 @@ from helpers import (
     save_embeddings_to_jsonl,
     diarize_segment,
 )
-from embeddings import get_audio_embedding, get_clap_embedding, save_embeddings_to_jsonl, query_from_jsonl
+from embeddings import get_audio_embedding, log_debug, get_clap_embedding, save_embeddings_to_jsonl, query_from_jsonl
 from speakers import assign_speaker_activity_to_vad_chunks, transcribe_with_fasterwhisper_and_assign_speaker_labels
-from rerankers import rerank_with_mmr, reciprocal_rank_fusion, rerank_segments
+from rerankers import reciprocal_rank_fusion, rerank_segments
 import os
 from collections import defaultdict
 import faiss
-
+import csv
+from pathlib import Path
+import time
 torchaudio.set_audio_backend("ffmpeg")
 
 use_clap = True
@@ -46,7 +48,7 @@ def timer(name):
     start = time.perf_counter()
     yield
     end = time.perf_counter()
-    #print(f"{name} took {end - start:.3f} seconds")
+    print(f"{name} took {end - start:.3f} seconds")
 
 def update_all_metadata_with_mapping():
     if single_file_state["metadata"] is None:
@@ -165,6 +167,40 @@ def save_full_state(path="data/full_state.pt"):
     except Exception as e:
         return f"❌ Error saving state: {str(e)}"
 
+def fix_missing_transcripts():
+    print("🔍 Checking for missing transcripts after loading state...")
+
+    num_fixed = 0
+
+    for idx, meta in enumerate(single_file_state["metadata"]):
+        transcript = meta.get("transcript_with_speaker_labels", "").strip()
+
+        if not transcript:
+            print(f"⚡ Transcribing missing transcript for segment {idx}...")
+            try:
+                snippet = single_file_state["audio_tensor"][idx]
+                snippet_np = snippet.cpu().numpy()
+
+                # Use your speaker-aware transcription
+                transcript = transcribe_with_fasterwhisper_and_assign_speaker_labels(
+                    snippet_np,
+                    single_file_state["sample_rate"],
+                    meta
+                )
+
+                if not transcript.strip():
+                    transcript = "[Empty after transcription]"
+
+                meta["transcript_with_speaker_labels"] = transcript
+                num_fixed += 1
+
+            except Exception as e:
+                print(f"❌ Failed to transcribe segment {idx}: {e}")
+                meta["transcript_with_speaker_labels"] = "[Error transcribing]"
+
+    print(f"✅ Finished fixing transcripts. {num_fixed} segments updated.")
+    return num_fixed
+
 def load_full_state(path="data/full_state.pt"):
     if not os.path.exists(path):
         return "❌ No saved state found."
@@ -172,10 +208,10 @@ def load_full_state(path="data/full_state.pt"):
     try:
         print("📦 Attempting to load state from:", path)
 
-        # ✅ Load first, so 'state' exists before using it
+        # ✅ Load saved state
         state = torch.load(path, map_location=device)
 
-        # Restore speaker mapping from external file
+        # Restore speaker mapping
         global per_podcast_speaker_mapping
         if os.path.exists("data/speaker_mappings.json"):
             with open("data/speaker_mappings.json", "r", encoding="utf-8") as f:
@@ -187,17 +223,16 @@ def load_full_state(path="data/full_state.pt"):
 
         _ = apply_per_podcast_speaker_mapping(json.dumps(per_podcast_speaker_mapping))
 
+        # Restore main state
         single_file_state["embeddings_tensor"] = state["embeddings_tensor"].to(device)
         single_file_state["metadata"] = state["metadata"]
 
-        # Load precomputed normalized embeddings (for faster similarity search)
         emb_tensor = state["embeddings_tensor"].to(device)
-        single_file_state["normalized_embeddings"] = torch.nn.functional.normalize(emb_tensor, dim=1)
+        normalized_embeddings = torch.nn.functional.normalize(emb_tensor, dim=1)
+        single_file_state["normalized_embeddings"] = normalized_embeddings
 
-        # Load JSONL once into memory
-        jsonl_path = "data/segments.jsonl"
-        if os.path.exists(jsonl_path):
-            with open(jsonl_path, "r") as f:
+        if os.path.exists("data/segments.jsonl"):
+            with open("data/segments.jsonl", "r") as f:
                 single_file_state["jsonl_entries"] = [json.loads(line) for line in f]
             print(f"📄 Loaded {len(single_file_state['jsonl_entries'])} entries from JSONL")
 
@@ -207,16 +242,36 @@ def load_full_state(path="data/full_state.pt"):
         global custom_speaker_mapping
         custom_speaker_mapping = state.get("speaker_mapping", custom_speaker_mapping)
 
-        # 🔥 Apply mapping to all metadata after loading
+        # 🔥 Apply mapping to metadata
         update_all_metadata_with_mapping()
 
-        # ✅ Now that it's updated, save the corrected JSONL
-        if single_file_state["embeddings_tensor"] is not None and single_file_state["metadata"] is not None:
-            save_embeddings_to_jsonl("data/segments.jsonl", single_file_state["embeddings_tensor"], single_file_state["metadata"])
-            print("💾 Resaved segments.jsonl with updated speaker labels.")
+        # 🔥🔥 Build FAISS index once here
+        print("⚙️ Building FAISS index...")
+        embeddings_np = normalized_embeddings.cpu().numpy().astype(np.float32)
+        faiss.normalize_L2(embeddings_np)
+
+        if torch.cuda.is_available():
+            res = faiss.StandardGpuResources()
+            index = faiss.IndexFlatIP(embeddings_np.shape[1])
+            index = faiss.index_cpu_to_gpu(res, 0, index)
+        else:
+            index = faiss.IndexFlatIP(embeddings_np.shape[1])
+
+        index.add(embeddings_np)
+        single_file_state["faiss_index"] = index
+        print(f"✅ FAISS index built with {embeddings_np.shape[0]} vectors.")
 
         print(f"✅ Loaded state with {len(single_file_state['metadata'])} segments.")
+        
+        num_fixed = fix_missing_transcripts()
+
+        if num_fixed > 0:
+            print("💾 Auto-saving updated full_state.pt...")
+            save_full_state("data/full_state_autosave.pt")
+
+
         return f"✅ Loaded full state with {len(single_file_state['metadata'])} segments."
+
     except Exception as e:
         print(f"❌ Exception in load_full_state: {e}")
         return f"❌ Error loading state: {str(e)}"
@@ -289,7 +344,7 @@ def index_podcast_folder(podcasts_folder="podcasts"):
                 with open(json_path, 'r', encoding='utf-8') as f:
                     metadata_info = json.load(f)
 
-            #print(f"\n🔍 Indexing {file_path}...")
+            print(f"\n🔍 Indexing {file_path}...")
 
             # Load + resample audio
             audio_tensor, sample_rate = load_mp3_ffmpeg(file_path)
@@ -298,29 +353,28 @@ def index_podcast_folder(podcasts_folder="podcasts"):
                 audio_tensor = resampler(audio_tensor)
                 sample_rate = 16000
 
-            # --- Limit to the first 5 minutes (300 seconds) ---
+            # --- Limit to the first 5 minutes (300 seconds) (Optional for debugging) ---
             # max_duration_seconds = 60  # 5 minutes
             # max_samples = int(max_duration_seconds * sample_rate)
             # if audio_tensor.shape[1] > max_samples:
             #     audio_tensor = audio_tensor[:, :max_samples]
-            # ---------------------------------------------------
 
             audio_np = audio_tensor.cpu().numpy()
 
             # Diarization
             diarization_results = diarize_segment(audio_np, sample_rate)
-            #print(f"🧠 Diarization produced {len(diarization_results)} segments.")
+            print(f"🧠 Diarization produced {len(diarization_results)} segments.")
 
             # VAD segmentation
             vad_segments, vad_metadata = segment_audio_silero(audio_tensor, sample_rate)
-            #print(f"🔊 VAD produced {len(vad_segments)} speech chunks.")
+            print(f"🔊 VAD produced {len(vad_segments)} speech chunks.")
 
             # ---- Attach raw speaker activity to each VAD segment ----
             # Pass an empty dict for the custom mapping to use raw labels.
             merged_segments, merged_metadata = assign_speaker_activity_to_vad_chunks(
                 vad_segments, vad_metadata, diarization_results, {}
             )
-            #print(f"🎤 Assigned speaker activity to {len(merged_segments)} VAD segments.")
+            print(f"🎤 Assigned speaker activity to {len(merged_segments)} VAD segments.")
 
             # Attach podcast metadata to each segment
             for meta in merged_metadata:
@@ -335,42 +389,65 @@ def index_podcast_folder(podcasts_folder="podcasts"):
             all_segments.extend(merged_segments)
             all_metadata.extend(merged_metadata)
 
-    #print(f"\n✅ Total segments collected from folder: {len(all_segments)}")
+    print(f"\n✅ Total segments collected from folder: {len(all_segments)}")
     avg_duration = np.mean([m["end_time"] - m["start_time"] for m in all_metadata])
-    #print(f"📊 Avg duration of segments: {avg_duration:.2f}s")
+    print(f"📊 Avg duration of segments: {avg_duration:.2f}s")
 
     # Compute embeddings and transcriptions
     embeddings = []
     stored_segments = []
+    valid_metadata = []
+
     for i, seg in enumerate(all_segments):
-        if seg.numel() == 0:
-            #print(f"⚠️ Skipping empty segment {i}")
+        if seg is None or seg.numel() == 0:
+            print(f"⚠️ Skipping empty segment {i}")
             continue
-        emb = get_clap_embedding(seg, 16000)
-        if np.any(np.isnan(emb)):
-            #print(f"⚠️ NaN in embedding for segment {i}")
+        log_debug(f"📦 Segment {i} stats — shape: {seg.shape}, min: {seg.min().item():.4f}, max: {seg.max().item():.4f}, mean: {seg.mean().item():.4f}")
+        try:
+            emb = get_clap_embedding(seg, 16000)
+
+            if emb is None or np.any(np.isnan(emb)) or emb.shape != (512,):
+                print(f"⚠️ Invalid embedding for segment {i}, skipping")
+                continue
+
+            embeddings.append(emb)
+            stored_segments.append(seg)
+            valid_metadata.append(all_metadata[i])
+
+        except Exception as e:
+            print(f"❌ Error at segment {i}: {e}")
             continue
-        embeddings.append(emb)
-        stored_segments.append(seg)
-        # Transcribe the segment using the new helper; this assigns raw speaker labels.
-        transcript = transcribe_with_fasterwhisper_and_assign_speaker_labels(seg, 16000, all_metadata[i], language="en")
-        # Save the transcript in metadata under the key "transcript_with_speaker_labels"
-        all_metadata[i]["transcript_with_speaker_labels"] = transcript
 
     if not embeddings:
-        return "❌ No valid embeddings computed from the podcasts folder."
+        raise RuntimeError("❌ No valid embeddings were created after processing all segments. Cannot continue.")
 
+    # Now embeddings are guaranteed valid
     embeddings_tensor = torch.from_numpy(np.stack(embeddings)).float().to(device)
 
-    # Save to global state
+    # Store
     single_file_state["embeddings_tensor"] = embeddings_tensor
-    single_file_state["metadata"] = all_metadata
+    single_file_state["metadata"] = valid_metadata
     single_file_state["audio_tensor"] = stored_segments
     single_file_state["sample_rate"] = 16000
 
-    #print(f"💾 Saving {len(all_metadata)} metadata entries and {len(stored_segments)} audio segments.")
+
+    print(f"💾 Saving {len(all_metadata)} metadata entries and {len(stored_segments)} audio segments.")
     durations = [m["end_time"] - m["start_time"] for m in all_metadata]
-    #print(f"⏱️ Final avg duration: {np.mean(durations):.2f}s")
+    print(f"⏱️ Final avg duration: {np.mean(durations):.2f}s")
+    print(f"📝 Transcribing {len(merged_segments)} segments with speaker labels...")
+
+    for seg, meta in zip(merged_segments, merged_metadata):
+        try:
+            seg_np = seg.cpu().numpy()
+            transcript = transcribe_with_fasterwhisper_and_assign_speaker_labels(
+                seg_np,  # audio segment
+                sample_rate,  # 16000 Hz
+                meta  # contains "start_time" and "speaker_activity"
+            )
+            meta["transcript_with_speaker_labels"] = transcript.strip()
+        except Exception as e:
+            print(f"❌ Error transcribing a segment: {e}")
+            meta["transcript_with_speaker_labels"] = "[Error during transcription]"
 
     # Save
     save_embeddings_to_jsonl("data/segments.jsonl", embeddings_tensor, all_metadata)
@@ -383,8 +460,6 @@ def index_podcast_folder(podcasts_folder="podcasts"):
 
 
 def run_evaluation():
-    import csv
-    from pathlib import Path
 
     queries = [
     "What are some other anime ‘genre mashups’ that completely surprised you?",
@@ -438,18 +513,25 @@ def run_evaluation():
     "What anime best captures the experience of being a broke, binge-drinking college student?",
     "If you made a Trash Taste Bingo Card, what squares would be absolutely required?"
     ]
-    AGENT_NAME = "agenteuc"
+    AGENT_NAME = "voxrag"
     QUERY_AUDIO_DIR = Path("eval/queries_audio")
-    DOC_FILE = "eval/documents_cos_cross_100.csv"
-    ANSWER_FILE = "eval/answers_cos_cross_100.csv"
+    DOC_FILE = "eval/documents_vanilla.csv"
+    ANSWER_FILE = "eval/answers_vanilla.csv"
+    TIMING_FILE = "eval/timing_vanilla.csv"
 
     try:
-        with open(DOC_FILE, "w", newline='', encoding="utf-8") as doc_f, open(ANSWER_FILE, "w", newline='', encoding="utf-8") as ans_f:
+        with open(DOC_FILE, "w", newline='', encoding="utf-8") as doc_f, \
+             open(ANSWER_FILE, "w", newline='', encoding="utf-8") as ans_f, \
+             open(TIMING_FILE, "w", newline='', encoding="utf-8") as timing_f:
+
             doc_writer = csv.writer(doc_f)
             doc_writer.writerow(["qid", "did", "document"])
 
             ans_writer = csv.writer(ans_f)
             ans_writer.writerow(["qid", "agent", "answer"])
+
+            timing_writer = csv.writer(timing_f)
+            timing_writer.writerow(["qid", "elapsed_seconds"])
 
             for i, query in enumerate(queries):
                 audio_path = QUERY_AUDIO_DIR / f"audios--{i+1:02d}.wav"
@@ -457,13 +539,19 @@ def run_evaluation():
                 if not audio_path.exists():
                     print(f"⚠️ Skipping Q{i}: {audio_path.name} does not exist.")
                     ans_writer.writerow([i, AGENT_NAME, "ERROR: Missing audio file"])
+                    timing_writer.writerow([i, "ERROR: Missing audio file"])
                     continue
 
                 print(f"🔍 Processing Q{i}: {query}")
                 print(f"🎧 Using audio: {audio_path}")
 
                 try:
+                    start_time = time.time()
+
                     result = query_rag(str(audio_path), single_file_state)
+
+                    end_time = time.time()
+                    elapsed = end_time - start_time
 
                     if not isinstance(result, tuple) or len(result) != 4:
                         raise ValueError("query_rag() must return a 4-tuple: (answer, html, all_context, retrieved_only)")
@@ -478,13 +566,16 @@ def run_evaluation():
                         doc_writer.writerow([i, did, f"{speaker} said: {clean_text}"])
 
                     ans_writer.writerow([i, AGENT_NAME, answer.strip()])
-                    print(f"✅ Q{i} completed.")
+                    timing_writer.writerow([i, f"{elapsed:.4f}"])
+
+                    print(f"✅ Q{i} completed in {elapsed:.2f} seconds.")
 
                 except Exception as e:
                     print(f"❌ Error on Q{i}: {e}")
                     ans_writer.writerow([i, AGENT_NAME, "ERROR"])
+                    timing_writer.writerow([i, "ERROR"])
 
-        return "✅ Evaluation completed. Results saved to answers.csv and documents.csv."
+        return "✅ Evaluation completed. Results saved to documents, answers, and timing CSVs."
 
     except Exception as e:
         return f"❌ Evaluation failed: {e}"
@@ -492,8 +583,8 @@ def run_evaluation():
 def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
     import os
     import torch
-    import faiss
     import numpy as np
+    import time
     from torch.nn import functional as F
 
     if query_audio_file is None:
@@ -504,8 +595,13 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
         print(f"❌ Audio file not found: {query_audio_file}")
         return "Audio file not found.", "", []
 
+    total_start = time.perf_counter()
     print(f"🎧 Loading audio: {query_audio_file}")
+
+    load_start = time.perf_counter()
     query_tensor, query_sr = load_mp3_ffmpeg(query_audio_file)
+    print(f"🔵 Audio load took {time.perf_counter() - load_start:.2f}s")
+
     if query_tensor is None or query_tensor.numel() == 0:
         print("❌ Failed to load or empty audio.")
         return "Failed to load audio file.", "", []
@@ -514,15 +610,24 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
         print("🔁 Resampling to 16kHz")
         resampler = torchaudio.transforms.Resample(query_sr, 16000)
         query_tensor = resampler(query_tensor)
+
     if query_tensor.dim() > 1:
         query_tensor = query_tensor.mean(dim=0)
 
+    transcribe_start = time.perf_counter()
     query_audio_np = query_tensor.cpu().numpy()
     query_transcription = transcribe_with_fasterwhisper(query_audio_np, 16000)
+    print(f"🟣 Transcription took {time.perf_counter() - transcribe_start:.2f}s")
 
+    embed_start = time.perf_counter()
     query_embedding = get_clap_embedding(query_tensor, 16000)
+    if query_embedding is None:
+        print("❌ Failed to get query embedding.")
+        return "Failed to create embedding.", "", []
+
     query_tensor = torch.tensor(query_embedding).float()
     query_tensor = F.normalize(query_tensor, dim=0).unsqueeze(0)
+    print(f"🟢 Embedding + normalize took {time.perf_counter() - embed_start:.2f}s")
 
     entries = single_file_state.get("jsonl_entries", [])
     all_embeddings_tensor = single_file_state.get("normalized_embeddings", None)
@@ -537,35 +642,26 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
     query_np = query_tensor.squeeze(0).cpu().numpy().astype(np.float32)
     faiss.normalize_L2(query_np.reshape(1, -1))
 
-    # 🔧 Rebuild FAISS if needed
-    if "faiss_index" not in single_file_state:
-        print("⚠️ Rebuilding FAISS index...")
-        all_embeddings_np = all_embeddings_tensor.cpu().numpy().astype(np.float32)
-        faiss.normalize_L2(all_embeddings_np)
-        index = faiss.IndexFlatIP(all_embeddings_np.shape[1])
-        index.add(all_embeddings_np)
-        single_file_state["faiss_index"] = index
-    else:
-        index = single_file_state["faiss_index"]
+    faiss_start = time.perf_counter()
 
+    index = single_file_state.get("faiss_index")
+    if index is None:
+        print("❌ FAISS index missing — please load or reindex.")
+        return "FAISS index missing.", "", []
+
+    print(f"🛠 FAISS setup took {time.perf_counter() - faiss_start:.2f}s")
+
+    search_start = time.perf_counter()
     top_k_pool = 100
     D, I = index.search(query_np.reshape(1, -1), k=min(top_k_pool, len(entries)))
+    print(f"🔍 FAISS search took {time.perf_counter() - search_start:.2f}s")
+
     top_indices = I[0].tolist()
     valid_indices = [i for i in top_indices if 0 <= i < len(entries)]
-
     top_results = [entries[i] for i in valid_indices][:10]
 
-    # Top-k for reranking
-    # retrieved_segments_for_rerank = [entries[i] for i in valid_indices]  # (e.g. top 50)
-
-    # Run reranker here
-    # query_text = query_transcription  # This is your natural language query
-    # reranked = rerank_segments(query_text, retrieved_segments_for_rerank)
-
-    # Now slice the top 10
-    # top_results = reranked[:10]
-
-    print(f"🔍 Top segment_ids: {[r['segment_id'] for r in top_results]}")
+    # Build prompt
+    prompt_start = time.perf_counter()
 
     prompt = f"User: {query_transcription}\nTranscription:\n"
     added_ids = set()
@@ -575,17 +671,24 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
     for result in top_results:
         idx = result["segment_id"]
         for neighbor_idx in [idx - 1, idx, idx + 1]:
+            print(f"Checking segment {neighbor_idx}...")
+
             if not (0 <= neighbor_idx < len(single_file_state["metadata"])):
-                print(f"⏭️ Skipping OOB segment {neighbor_idx}")
+                print(f" - Skipped: out of bounds")
                 continue
             if neighbor_idx in added_ids:
+                print(f" - Skipped: already added")
                 continue
 
             meta = single_file_state["metadata"][neighbor_idx]
             transcript = meta.get("transcript_with_speaker_labels")
+
             if not transcript or transcript.strip() == "":
-                print(f"⚠️ Skipping empty transcript at segment {neighbor_idx}")
+                print(f" - Skipped: empty transcript")
                 continue
+
+            print(f" - ✅ Adding segment {neighbor_idx} with transcript len={len(transcript)}")
+
 
             speaker = meta.get("speaker", "unknown")
             title = meta.get("podcast_title", "Unknown")
@@ -614,15 +717,28 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
             )
             audio_segments_to_display.append(audio_html)
 
-    print(f"✅ Returning {len(segment_contexts)} transcript segments")
+    print(f"📝 Prompt build took {time.perf_counter() - prompt_start:.2f}s")
 
-    mapping_block = {
-        "The 7 Anime That Every Fan NEEDS To Watch Trash Taste #172": {
-            "speaker_0": "Joey",
-            "speaker_1": "Connor",
-            "speaker_3": "Garnt"
-        }
-    }
+    # LLM Call
+    openai_start = time.perf_counter()
+
+    # Build a dynamic mapping block
+    mapping_block = {}
+
+    for result in top_results:
+        title = result.get("podcast_title", "Unknown Podcast")
+        if title not in mapping_block:
+            # Pull mapping from your global per_podcast_speaker_mapping
+            if title in per_podcast_speaker_mapping:
+                mapping_block[title] = per_podcast_speaker_mapping[title]
+            else:
+                mapping_block = {
+                    "The 7 Anime That Every Fan NEEDS To Watch Trash Taste #172": {
+                        "speaker_0": "Joey",
+                        "speaker_1": "Connor",
+                        "speaker_3": "Garnt"
+                    }
+                }
 
     response = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -649,6 +765,7 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
         temperature=0.7,
         max_tokens=500,
     )
+    print(f"💬 OpenAI call took {time.perf_counter() - openai_start:.2f}s")
 
     answer = response.choices[0].message.content
     print(f"🧠 Answer generated. Length: {len(answer)} chars")
@@ -659,12 +776,25 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
         if 0 <= segment_id < len(single_file_state["metadata"]):
             meta = single_file_state["metadata"][segment_id]
             speaker = meta.get("speaker", "unknown")
-            transcript = meta.get("transcript_with_speaker_labels", "").strip()
-            if transcript:
-                retrieved_segments.append((segment_id, speaker, transcript))
-    print(retrieved_segments)
+            transcript = meta.get("transcript_with_speaker_labels")
+
+    total_time = time.perf_counter() - total_start
+    print(f"✅ Total query_rag() time: {total_time:.2f}s")
+
+    # print("\n=== AUDIO SEGMENTS TO DISPLAY ===")
+    # if not audio_segments_to_display:
+    #     print("⚠️ No audio segments generated!")
+    # else:
+    #     for idx, html in enumerate(audio_segments_to_display):
+    #         short_preview = html.replace("\n", "").replace(" ", "")[:100]  # squish and truncate
+    #         print(f"[{idx}] {short_preview}...")
+    #     print(f"✅ Total segments: {len(audio_segments_to_display)}")
+
     return answer, "".join(audio_segments_to_display), segment_contexts, retrieved_segments
 
+def query_rag_for_ui(query_audio, lambda_val):
+    answer, audio_html, segment_contexts, retrieved_segments = query_rag(query_audio, lambda_val)
+    return answer, audio_html, segment_contexts  # only return 3 for Gradio
 
 def get_example_segments_and_timelines_html():
     """
@@ -687,7 +817,7 @@ def get_example_segments_and_timelines_html():
         # Group by Podcast Title
         title_to_segments = defaultdict(list)
         for i, meta in enumerate(metadata):
-            title = meta.get("Podcast Title", f"Untitled_{i}")
+            title = meta.get("podcast_title", f"Untitled_{i}")
             title_to_segments[title].append((meta, audio_segments[i]))
 
         if not title_to_segments:
@@ -818,10 +948,10 @@ with gr.Blocks() as demo:
         audio_output = gr.HTML(label="Retrieved Segments (Audio)")
 
         segment_contexts_state = gr.State()
-        query_btn.click(query_rag, [query_input, lambda_slider], [answer_output, audio_output, segment_contexts_state])
+        query_btn.click(query_rag_for_ui, [query_input, lambda_slider], [answer_output, audio_output, segment_contexts_state])
 
-# Launch the Gradio interface
-demo.launch()
+import sys
 
 if __name__ == "__main__":
-    demo.launch(server_port=7860, share=False)
+    share_flag = "--share" in sys.argv
+    demo.launch(server_port=7861, share=share_flag)
