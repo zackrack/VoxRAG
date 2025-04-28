@@ -2,9 +2,12 @@ gradio
 torch
 torchaudio
 torchvision
-numpy
+numpy<2
 openai
 transformers
 faster-whisper
 soundfile
-pip install git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]
+git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]
+faiss-gpu
+omegaconf
+ctranslate2==4.4.0

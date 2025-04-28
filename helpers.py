@@ -24,7 +24,7 @@ wav2vec_model.eval()
 torchaudio.set_audio_backend("ffmpeg")
 
 # ----- Faster-Whisper Setup for Transcription -----
-whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
+whisper_model = WhisperModel("large", device="cuda", compute_type="float16")
 
 def get_audio_embedding(audio_tensor, sample_rate):
     if audio_tensor.numel() == 0:
@@ -285,13 +285,14 @@ import io
 
 def audio_to_html(audio_np, sample_rate):
     if audio_np.ndim > 1:
-        audio_np = audio_np.mean(axis=0)
+        audio_np = audio_np.mean(axis=0)  # flatten stereo to mono
 
     buffer = io.BytesIO()
-    sf.write(buffer, audio_np.T, sample_rate, format="WAV")
+    sf.write(buffer, audio_np, sample_rate, format="WAV")  # no .T needed
     buffer.seek(0)
     b64_audio = base64.b64encode(buffer.read()).decode("utf-8")
     return f'<audio controls src="data:audio/wav;base64,{b64_audio}"></audio>'
+
 
 import os
 import json
