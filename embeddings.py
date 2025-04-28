@@ -7,6 +7,25 @@ import torchaudio
 import numpy as np
 from transformers import Wav2Vec2Processor, Wav2Vec2Model, AutoProcessor, AutoModel
 
+import os
+import numpy as np
+import torch
+import torchaudio
+
+DEBUG_LOG_FILE = "embedding_debug_log.txt"
+
+# Set your model's correct embedding dimension here
+EXPECTED_EMBEDDING_DIM = 512  # ✅ updated for your model!
+
+# Initialize log at script startup (optional)
+with open(DEBUG_LOG_FILE, "w", encoding="utf-8") as f:
+    f.write("=== Embedding Debug Log Start ===\n")
+
+def log_debug(message):
+    """Append debug messages to a local text file."""
+    with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(message + "\n")
+    print(message)
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -22,6 +41,72 @@ clap_processor = AutoProcessor.from_pretrained("laion/clap-htsat-unfused")
 clap_model = AutoModel.from_pretrained("laion/clap-htsat-unfused")
 clap_model.to(device)
 clap_model.eval()
+
+from transformers import AutoFeatureExtractor, WavLMModel
+
+wavlm_processor = AutoFeatureExtractor.from_pretrained("microsoft/wavlm-large")
+wavlm_model = WavLMModel.from_pretrained("microsoft/wavlm-large")
+
+wavlm_model.to(device)
+wavlm_model.eval()
+
+def get_wavlm_embedding(audio_tensor, sample_rate):
+    """
+    Extracts a normalized WavLM embedding from an audio tensor.
+    Args:
+        audio_tensor (torch.Tensor): [samples] or [channels, samples] mono/stereo waveform.
+        sample_rate (int): Original sample rate of the audio.
+    Returns:
+        np.ndarray: Normalized embedding vector (1024-dim).
+    """
+    if audio_tensor.numel() == 0:
+        log_debug("⚠️ Empty audio tensor received. Returning zero embedding.")
+        return np.zeros((1024,), dtype=np.float32)
+
+    # Resample to 16kHz if needed
+    if sample_rate != 16000:
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+        audio_tensor = resampler(audio_tensor)
+        log_debug("🔄 Resampled audio to 16kHz.")
+
+    # Convert to mono if stereo
+    if audio_tensor.dim() > 1:
+        audio_tensor = audio_tensor.mean(dim=0)
+        log_debug("🎛️ Converted audio to mono.")
+
+    # Ensure shape [batch, samples]
+    audio_tensor = audio_tensor.unsqueeze(0)
+
+    # Normalize to 5 seconds (5 * 16000 = 80000 samples)
+    # target_samples = 16000 * 5
+    # if audio_tensor.shape[1] < target_samples:
+    #     pad = target_samples - audio_tensor.shape[1]
+    #     audio_tensor = torch.nn.functional.pad(audio_tensor, (0, pad))
+    #     log_debug(f"🩹 Padded audio to 5 seconds.")
+    # else:
+    #     audio_tensor = audio_tensor[:, :target_samples]
+    #     log_debug(f"✂️ Truncated audio to 5 seconds.")
+
+    # Process the audio
+    inputs = wavlm_processor(audio_tensor.squeeze(0).cpu().numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = wavlm_model(**inputs)
+
+    # Take mean of last hidden state as embedding
+    embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()[0]
+    norm = np.linalg.norm(embedding)
+
+    if np.isnan(embedding).any():
+        log_debug("🚨 NaNs detected in WavLM embedding! Returning zero vector.")
+        return np.zeros((1024,), dtype=np.float32)
+
+    if norm == 0:
+        log_debug("🚨 Zero-norm WavLM embedding detected! Returning zero vector.")
+        return np.zeros((1024,), dtype=np.float32)
+
+    return embedding / norm
 
 def get_audio_embedding(audio_tensor, sample_rate):
     """
@@ -45,12 +130,12 @@ def get_audio_embedding(audio_tensor, sample_rate):
     audio_tensor = audio_tensor.unsqueeze(0)
 
     # Normalize to 5 seconds (5 * 16000 samples)
-    target_samples = 16000 * 5
-    if audio_tensor.shape[1] < target_samples:
-        pad = target_samples - audio_tensor.shape[1]
-        audio_tensor = torch.nn.functional.pad(audio_tensor, (0, pad))
-    else:
-        audio_tensor = audio_tensor[:, :target_samples]
+    # target_samples = 16000 * 5
+    # if audio_tensor.shape[1] < target_samples:
+    #     pad = target_samples - audio_tensor.shape[1]
+    #     audio_tensor = torch.nn.functional.pad(audio_tensor, (0, pad))
+    # else:
+    #     audio_tensor = audio_tensor[:, :target_samples]
 
     # Process the audio and compute the embedding
     inputs = processor(audio_tensor.squeeze(0).numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
@@ -64,25 +149,6 @@ def get_audio_embedding(audio_tensor, sample_rate):
     norm = np.linalg.norm(embedding)
     return embedding / norm if norm > 0 else embedding
 
-import os
-import numpy as np
-import torch
-import torchaudio
-
-DEBUG_LOG_FILE = "embedding_debug_log.txt"
-
-# Set your model's correct embedding dimension here
-EXPECTED_EMBEDDING_DIM = 512  # ✅ updated for your model!
-
-# Initialize log at script startup (optional)
-with open(DEBUG_LOG_FILE, "w", encoding="utf-8") as f:
-    f.write("=== Embedding Debug Log Start ===\n")
-
-def log_debug(message):
-    """Append debug messages to a local text file."""
-    with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(message + "\n")
-    print(message)
 
 def get_clap_embedding(audio_tensor, sample_rate, pooling_strategy="mean"):
     """

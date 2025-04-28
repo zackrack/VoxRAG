@@ -9,7 +9,7 @@ from helpers import (
     save_embeddings_to_jsonl,
     diarize_segment,
 )
-from embeddings import get_audio_embedding, log_debug, get_clap_embedding, save_embeddings_to_jsonl, query_from_jsonl
+from embeddings import get_audio_embedding, log_debug, get_clap_embedding, save_embeddings_to_jsonl, query_from_jsonl, get_wavlm_embedding
 from speakers import assign_speaker_activity_to_vad_chunks, transcribe_with_fasterwhisper_and_assign_speaker_labels
 from rerankers import reciprocal_rank_fusion, rerank_segments
 import os
@@ -262,13 +262,19 @@ def load_full_state(path="data/full_state.pt"):
         print(f"✅ FAISS index built with {embeddings_np.shape[0]} vectors.")
 
         print(f"✅ Loaded state with {len(single_file_state['metadata'])} segments.")
-        
+
+        # 🧹 Force-clear existing transcripts for re-transcription
+        # for meta in single_file_state["metadata"]:
+        #     meta["transcript_with_speaker_labels"] = ""
+
+        for meta in single_file_state["metadata"]:
+            meta["podcast_title"] = meta.get("podcast_title") or "unknown_podcast"
+
         num_fixed = fix_missing_transcripts()
 
         if num_fixed > 0:
             print("💾 Auto-saving updated full_state.pt...")
             save_full_state("data/full_state_autosave.pt")
-
 
         return f"✅ Loaded full state with {len(single_file_state['metadata'])} segments."
 
@@ -277,10 +283,6 @@ def load_full_state(path="data/full_state.pt"):
         return f"❌ Error loading state: {str(e)}"
 
 def apply_per_podcast_speaker_mapping(mapping_json_by_title):
-    """
-    Accepts a dict of { title: { speaker_0: Name, ... } }
-    and updates metadata and global map accordingly.
-    """
     global per_podcast_speaker_mapping
 
     try:
@@ -290,16 +292,19 @@ def apply_per_podcast_speaker_mapping(mapping_json_by_title):
 
         per_podcast_speaker_mapping = mappings
 
-        # Apply new mapping to all segments
+        # IMPORTANT: Reset all speaker names back to original labels first
+        for meta in single_file_state.get("metadata", []):
+            meta["speaker"] = meta.get("speaker_label", meta.get("speaker"))
+
+        # Now apply mapping
         for meta in single_file_state.get("metadata", []):
             title = meta.get("podcast_title", "Unknown")
             label = meta.get("speaker_label")
             if title in mappings and label in mappings[title]:
                 meta["speaker"] = mappings[title][label]
             else:
-                meta["speaker"] = label  # fallback to raw
+                meta["speaker"] = label  # fallback
 
-        # Save new version to .jsonl
         save_embeddings_to_jsonl(
             "data/segments.jsonl",
             single_file_state["embeddings_tensor"],
@@ -309,6 +314,7 @@ def apply_per_podcast_speaker_mapping(mapping_json_by_title):
         return "✅ Per-episode speaker mappings applied."
     except Exception as e:
         return f"❌ Error applying mappings: {str(e)}"
+
 
 import subprocess 
 
@@ -376,14 +382,13 @@ def index_podcast_folder(podcasts_folder="podcasts"):
             )
             print(f"🎤 Assigned speaker activity to {len(merged_segments)} VAD segments.")
 
-            # Attach podcast metadata to each segment
+            podcast_title = base_name
+
             for meta in merged_metadata:
-                meta["podcast_title"] = metadata_info.get("title", base_name)
-                meta["upload_date"] = metadata_info.get("upload_date", "N/A")
-                meta["uploader"] = metadata_info.get("uploader", "N/A")
-                meta["webpage_url"] = metadata_info.get("webpage_url", "N/A")
-                if not isinstance(meta["webpage_url"], str) or meta["webpage_url"].startswith("<audio"):
-                    meta["webpage_url"] = "N/A"
+                meta["podcast_title"] = podcast_title  # ← Always from filename now
+                meta["upload_date"] = "N/A"  # No upload date
+                meta["uploader"] = "N/A"     # No uploader
+                meta["webpage_url"] = "N/A"  # No webpage
 
             # Use these segments from here on
             all_segments.extend(merged_segments)
@@ -404,9 +409,9 @@ def index_podcast_folder(podcasts_folder="podcasts"):
             continue
         log_debug(f"📦 Segment {i} stats — shape: {seg.shape}, min: {seg.min().item():.4f}, max: {seg.max().item():.4f}, mean: {seg.mean().item():.4f}")
         try:
-            emb = get_clap_embedding(seg, 16000)
+            emb = get_wavlm_embedding(seg, 16000)
 
-            if emb is None or np.any(np.isnan(emb)) or emb.shape != (512,):
+            if emb is None or np.any(np.isnan(emb)):
                 print(f"⚠️ Invalid embedding for segment {i}, skipping")
                 continue
 
@@ -620,7 +625,7 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
     print(f"🟣 Transcription took {time.perf_counter() - transcribe_start:.2f}s")
 
     embed_start = time.perf_counter()
-    query_embedding = get_clap_embedding(query_tensor, 16000)
+    query_embedding = get_wavlm_embedding(query_tensor, 16000)
     if query_embedding is None:
         print("❌ Failed to get query embedding.")
         return "Failed to create embedding.", "", []
@@ -652,13 +657,14 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
     print(f"🛠 FAISS setup took {time.perf_counter() - faiss_start:.2f}s")
 
     search_start = time.perf_counter()
-    top_k_pool = 100
+    top_k_pool = 30
     D, I = index.search(query_np.reshape(1, -1), k=min(top_k_pool, len(entries)))
     print(f"🔍 FAISS search took {time.perf_counter() - search_start:.2f}s")
 
     top_indices = I[0].tolist()
     valid_indices = [i for i in top_indices if 0 <= i < len(entries)]
-    top_results = [entries[i] for i in valid_indices][:10]
+    top_results = [entries[i] for i in valid_indices]
+    top_results = rerank_segments(query_transcription, top_results)
 
     # Build prompt
     prompt_start = time.perf_counter()
@@ -671,7 +677,7 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
     for result in top_results:
         idx = result["segment_id"]
         for neighbor_idx in [idx - 1, idx, idx + 1]:
-            print(f"Checking segment {neighbor_idx}...")
+            # print(f"Checking segment {neighbor_idx}...")
 
             if not (0 <= neighbor_idx < len(single_file_state["metadata"])):
                 print(f" - Skipped: out of bounds")
@@ -687,7 +693,7 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
                 print(f" - Skipped: empty transcript")
                 continue
 
-            print(f" - ✅ Adding segment {neighbor_idx} with transcript len={len(transcript)}")
+            # print(f" - ✅ Adding segment {neighbor_idx} with transcript len={len(transcript)}")
 
 
             speaker = meta.get("speaker", "unknown")
@@ -723,41 +729,57 @@ def query_rag(query_audio_file, lambda_param=0.5, length_alpha=0.05):
     openai_start = time.perf_counter()
 
     # Build a dynamic mapping block
-    mapping_block = {}
+    # mapping_block = {}
 
-    for result in top_results:
-        title = result.get("podcast_title", "Unknown Podcast")
-        if title not in mapping_block:
-            # Pull mapping from your global per_podcast_speaker_mapping
-            if title in per_podcast_speaker_mapping:
-                mapping_block[title] = per_podcast_speaker_mapping[title]
-            else:
-                mapping_block = {
-                    "The 7 Anime That Every Fan NEEDS To Watch Trash Taste #172": {
-                        "speaker_0": "Joey",
-                        "speaker_1": "Connor",
-                        "speaker_3": "Garnt"
-                    }
-                }
+    # for result in top_results:
+    #     title = result.get("podcast_title", "Unknown Podcast")
+    #     if title not in mapping_block:
+    #         # Pull mapping from your global per_podcast_speaker_mapping
+    #         if title in per_podcast_speaker_mapping:
+    #             mapping_block[title] = per_podcast_speaker_mapping[title]
+    #         else:
+    #             mapping_block[title] = {
+    #                 "speaker_0": "speaker_0",
+    #                 "speaker_1": "speaker_1",
+    #                 "speaker_2": "speaker_2"
+    #             }
+    # print(mapping_block)
+
+    with open("data/speaker_mappings.json", "r", encoding="utf-8") as f:
+        mapping_block = json.load(f)
+    print(mapping_block)
 
     response = openai.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[
             {
                 "role": "system",
                 "content": (
-                    f"""You are a helpful assistant that uses only the provided transcription to answer the user's query. 
-                    Please cite the *Segment number* (e.g., "Segment 2") and answer in your own words. 
-                    Do not use timestamps. Speaker labels like "speaker_0" appear in the transcript. 
-                    If the context is there, please use the names of the people talking instead of speaker_0, etc.
+                    f"""You are a helpful assistant that uses only the provided transcription content to answer the user's query.
 
-                    Here are the mappings of speaker labels to real speaker names:
+                    General Behavior:
+                    - You must base your answers only on the transcription content.
+                    - You are allowed to freely summarize, explain, and connect ideas using the transcription material.
+                    - Always cite the Segment number (e.g., "Segment 2") where the information was found when you reference a fact or statement.
+                    - You should infer reasonable facts if they are clearly implied by the speakers, even if they are phrased casually or humorously.
+                    - You may rephrase the information into your own words, but do not invent new facts or events that were not suggested in the transcription.
+                    - If names of games, anime, movies, shows, foods, people, or places are mentioned, you must preserve them exactly as stated.
+                    - Minor typos, slang, mispronunciations, or shorthand should be reasonably interpreted for clarity.
+                    - If a name, title, or important detail is missing or unclear, you must explicitly say "unspecified" instead of guessing.
+                    - If the user asks about a specific speaker, answer using only that speaker's content, mapped to their real name.
+
+                    Speaker Mapping:
+                    - You are given a speaker mapping for each episode. Replace speaker labels like "speaker_0," "speaker_1," etc., with the real speaker names (e.g., Connor, Joey, Garnt, ProZD, Mori Calliope, etc.) 
+                      according to the mapping for that episode.
+                    - Never output "speaker_0", "speaker_1", etc., in your final answer — always use the mapped real names.
+
+                    Remember:
+                    - Prioritize clarity, completeness, and relevance.
+                    - You are allowed to organize the information logically, but stay faithful to the spirit and details of what was actually said.
+
                     {mapping_block}
 
-                    If the user asks about a specific speaker, answer only from that speaker's content. 
-                    If it’s a general or indirect query, include perspectives from multiple speakers if relevant.
-
-                    Use only the most relevant segments (marked as 'relevant match') when forming your main answer."""
+                    """
                 )
             },
             {"role": "user", "content": prompt + "\nAssistant:\n"}
@@ -946,9 +968,29 @@ with gr.Blocks() as demo:
         query_btn = gr.Button("Retrieve Answer")
         answer_output = gr.Textbox(label="LLM Answer")
         audio_output = gr.HTML(label="Retrieved Segments (Audio)")
-
+        transcript_output = gr.HTML(label="Retrieved Transcripts")
         segment_contexts_state = gr.State()
-        query_btn.click(query_rag_for_ui, [query_input, lambda_slider], [answer_output, audio_output, segment_contexts_state])
+
+        def show_segment_contexts_html(segment_contexts):
+            if not segment_contexts:
+                return "<div>No segments retrieved.</div>"
+
+            html = "<h3>Retrieved Segment Transcripts</h3><ul>"
+            for i, (speaker, text) in enumerate(segment_contexts, 1):
+                html += f"<li><b>Speaker:</b> {speaker}<br><pre>{text}</pre></li><br>"
+            html += "</ul>"
+            return html
+
+        query_btn.click(
+            query_rag_for_ui, 
+            [query_input, lambda_slider], 
+            [answer_output, audio_output, segment_contexts_state]
+        ).then(
+            show_segment_contexts_html,
+            inputs=[segment_contexts_state],
+            outputs=[transcript_output]
+        )
+
 
 import sys
 

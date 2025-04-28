@@ -2,14 +2,19 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 
 # Load a reranker model (e.g., MiniLM-based)
-tokenizer = AutoTokenizer.from_pretrained("cross-encoder/ms-marco-MiniLM-L-6-v2")
-model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L-6-v2")
+tokenizer = AutoTokenizer.from_pretrained("cross-encoder/ms-marco-MiniLM-L6-v2")
+model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L6-v2")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
 
 def rerank_segments(query, docs):
+    # Inside rerank_segments:
     inputs = tokenizer(
         [f"{query} [SEP] {doc}" for doc in docs],
         return_tensors='pt', padding=True, truncation=True
     )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
     with torch.no_grad():
         scores = model(**inputs).logits.squeeze(-1)
     sorted_docs = [doc for _, doc in sorted(zip(scores, docs), reverse=True)]
