@@ -1,13 +1,14 @@
 
 # VoxRAG: Transcription-Free Retrieval-Augmented Generation for Spoken Question Answering
 
-**arXiv:2505.17326v1 [cs.IR]**  
-**Authors:** Zackary Rackauckas, Julia Hirschberg  
-**Affiliation:** Columbia University  
-
 ---
 
 ## 🔍 Overview
+
+
+**Please cite our paper** if you use this codebase or reference VoxRAG in your research:
+
+> *Zackary Rackauckas, Julia Hirschberg. “VoxRAG: A Step Toward Transcription-Free RAG Systems in Spoken Question Answering.” arXiv:2505.17326v1 [cs.IR], May 2025.*
 
 **VoxRAG** is a modular speech-to-speech retrieval-augmented generation (RAG) pipeline that bypasses automatic speech recognition (ASR) to retrieve and reason over semantically relevant podcast audio using **audio embeddings** alone. It performs end-to-end semantic search and QA directly on spoken audio.
 
