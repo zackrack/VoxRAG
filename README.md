@@ -29,6 +29,8 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+## Notes
+
 Make sure ffmpeg is installed on your system. If you want to use CUDA, you will have to install torch seperately: https://pytorch.org/get-started/locally/.
 ---
 
