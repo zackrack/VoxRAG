@@ -90,6 +90,7 @@ VoxRAG/
 - `eval/` is used from the "Run Evaluation" tab in Gradio. It assumes:
   - Spoken query audio lives in `eval/queries_audio/`
   - Outputs are saved to CSVs (retrieved docs, generated answers, timing).
+  - You can find eval scripts in the RAGElo repository here: https://github.com/zetaalphavector/RAGElo
 
 ---
 
