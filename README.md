@@ -29,12 +29,12 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
-
+Make sure ffmpeg is installed on your system.
 ---
 
 ## ▶️ Running VoxRAG
 
-### To run the FastAPI server locally:
+### To run the interface locally:
 
 ```bash
 python app.py
@@ -45,6 +45,55 @@ python app.py
 ```bash
 python app.py --share
 ```
+
+## 📁 Project File Structure (Data & Audio Folders)
+
+```
+VoxRAG/
+├── app.py                        # Main entry point with Gradio + FastAPI server
+├── data/                         # Saved models, metadata, and embeddings
+│   ├── full_state.pt             # Serialized PyTorch state: embeddings, metadata, audio
+│   ├── full_state_autosave.pt    # Autosave backup of the same
+│   ├── audio_segments.pt         # Serialized list of audio segment tensors
+│   ├── speaker_mappings.json     # Custom per-podcast speaker names
+│   ├── segments.jsonl            # Final per-segment metadata for retrieval
+│
+├── podcasts/                     # Folder containing raw podcast audio
+│   ├── episode1.wav              # Any supported format: .wav, .mp3, .webm
+│   ├── episode1.json             # (Optional) Metadata sidecar for the episode
+│   └── ...
+│
+├── eval/                         # Evaluation scripts and output
+│   ├── queries_audio/            # 50 spoken query .wav files
+│   ├── documents_vanilla.csv     # Retrieved text segments per query
+│   ├── answers_vanilla.csv       # Answers from GPT-4o
+│   ├── timing_vanilla.csv        # Timing for each query evaluation
+│
+├── embeddings.py                 # CLAP / WavLM embedding functions
+├── rerankers.py                  # Optional reranker (e.g. cross-encoder)
+├── helpers.py                    # Audio preprocessing, segmentation, transcription
+├── speakers.py                   # Diarization and speaker label assignment
+├── requirements.txt
+├── README.md
+```
+
+### 💡 How They're Used
+
+- `podcasts/` is scanned by `index_podcast_folder()`. It expects `.wav`, `.mp3`, or `.webm` podcast files.  
+  You can also place optional `.json` metadata next to audio files with the same base name.
+  
+- `data/` is automatically created to store:
+  - All indexed embeddings and audio segments (`full_state.pt`)
+  - Segment-level metadata for retrieval (`segments.jsonl`)
+  - Final transcript+speaker mappings (`speaker_mappings.json`)
+
+- `eval/` is used when running `--mode eval` or from the "Run Evaluation" tab in Gradio. It assumes:
+  - Spoken query audio lives in `eval/queries_audio/`
+  - Outputs are saved to CSVs (retrieved docs, generated answers, timing).
+
+---
+
+You can copy this section into your `README.md` under the **Installation** or **Usage** section to make file organization clear for users and collaborators.
 
 
 ---
