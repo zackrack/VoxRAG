@@ -87,14 +87,9 @@ VoxRAG/
   - Segment-level metadata for retrieval (`segments.jsonl`)
   - Final transcript+speaker mappings (`speaker_mappings.json`)
 
-- `eval/` is used when running `--mode eval` or from the "Run Evaluation" tab in Gradio. It assumes:
+- `eval/` is used from the "Run Evaluation" tab in Gradio. It assumes:
   - Spoken query audio lives in `eval/queries_audio/`
   - Outputs are saved to CSVs (retrieved docs, generated answers, timing).
-
----
-
-You can copy this section into your `README.md` under the **Installation** or **Usage** section to make file organization clear for users and collaborators.
-
 
 ---
 
@@ -146,12 +141,3 @@ Retrieval-Augmented Generation (RAG) is typically text-centric. VoxRAG proposes 
 - Precision and factual granularity remain key limitations.
 
 ---
-
-## 🛠️ Installation
-
-```bash
-git clone https://github.com/your-username/VoxRAG.git
-cd VoxRAG
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
