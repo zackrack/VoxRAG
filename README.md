@@ -20,6 +20,33 @@ This repository includes:
 - Optional reranking with a cross-encoder
 - GPT-4o-based answer generation
 
+## 🛠️ Installation
+
+```bash
+git clone https://github.com/your-username/VoxRAG.git
+cd VoxRAG
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## ▶️ Running VoxRAG
+
+### To run the FastAPI server locally:
+
+```bash
+python app.py
+```
+
+### To deploy publicly using Gradio:
+
+```bash
+python app.py --share
+```
+
+
 ---
 
 ## 🧠 Motivation
